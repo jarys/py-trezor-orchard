@@ -1,0 +1,35 @@
+[package]
+name = "pyorchard"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.maturin]
+classifier = [
+  "Programming Language :: Rust",
+  "Operating System :: POSIX :: Linux",
+]
+
+[dependencies]
+nonempty = "0.7"
+libc = "0.2"
+ff = "0.12"
+rand = "0.8"
+rand_core = "0.6.3"
+rand_chacha = "0.3.1"
+pyo3 = { version = "0.15", features = ["extension-module"] }
+orchard = "0.2"
+pasta_curves = "0.4"
+#zcash_note_encryption = "0.1"
+#zcash_note_encryption = { path = "/home/agi/code/librustzcash/components/zcash_note_encryption"}
+zcash_primitives = "0.7.0"
+#zcash_primitives = { path = "/home/agi/code/librustzcash/zcash_primitives"}
+subtle = "2.3"
+incrementalmerkletree = "0.3"
+
+[patch.crates-io.orchard]
+path = "/home/agi/code/orchard"
