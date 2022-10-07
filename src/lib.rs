@@ -1,133 +1,83 @@
-use pyo3::{create_exception, prelude::*, wrap_pyfunction};
-
-use rand::thread_rng;
-use rand_core::RngCore;
+use core::fmt;
+use pyo3::{
+    create_exception,
+    prelude::*,
+    types::{PyBytes, PyDict},
+    wrap_pyfunction,
+};
 
 use ff::{Field, PrimeField};
+use rand::thread_rng;
+use rand_core::{CryptoRng, RngCore};
+use trezor_orchard as inner;
 
 use orchard::{
+    self,
+    builder::{
+        InProgress, InProgressSignatures, PartiallyAuthorized, SigningMetadata, SigningParts,
+        SpendInfo, Unauthorized, Unproven,
+    },
+    bundle::{Authorized, Flags},
     circuit::{Circuit, Instance, Proof},
-    keys::{FullViewingKey, SpendValidatingKey},
+    keys::{FullViewingKey, Scope, SpendValidatingKey},
     note::{ExtractedNoteCommitment, Nullifier},
+    primitives::redpallas,
     primitives::redpallas::{SpendAuth, VerificationKey},
     tree::Anchor,
     value::{ValueCommitTrapdoor, ValueCommitment, ValueSum},
     Address,
 };
 
-use zcash_primitives::transaction::components::orchard::read_v5_bundle;
+use zcash_primitives::transaction::components::{
+    amount::Amount,
+    orchard::{read_v5_bundle, write_v5_bundle},
+};
 
 create_exception!(pyorchard, ProvingError, pyo3::exceptions::PyException);
 
 #[pymodule]
-fn trezor_orchard(py: Python, m: &PyModule) -> PyResult<()> {
+fn py_trezor_orchard(py: Python, m: &PyModule) -> PyResult<()> {
     m.add("ProvingError", py.get_type::<ProvingError>())?;
-    m.add_class::<Note>()?;
-    m.add_class::<Prover>()?;
+    m.add_class::<OrchardInput>()?;
+    m.add_class::<OrchardOutput>()?;
+    m.add_class::<TrezorBuilder>()?;
+    m.add_class::<Bundle>()?;
     m.add_class::<ProvingKey>()?;
-    m.add_class::<Witness>()?;
-    m.add_class::<Note>()?;
     m.add_wrapped(wrap_pyfunction!(verify_bundle))?;
     Ok(())
 }
 
-#[pyclass]
-#[derive(Clone, Debug)]
-struct Note(orchard::note::Note);
+fn note_from_parts(
+    recipient: [u8; 43],
+    value: u64,
+    rho: [u8; 32],
+    rseed: [u8; 32],
+) -> orchard::note::Note {
+    let recipient = Address::from_raw_address_bytes(&recipient).unwrap();
+    let value = orchard::value::NoteValue::from_raw(value);
+    let rho = orchard::note::Nullifier::from_bytes(&rho).unwrap();
+    let rseed = orchard::note::RandomSeed::from_bytes(rseed, &rho).unwrap();
 
-#[pymethods]
-impl Note {
-    #[staticmethod]
-    fn from_parts(recipient: [u8; 43], value: u64, rho: [u8; 32], rseed: [u8; 32]) -> Self {
-        let recipient = Address::from_raw_address_bytes(&recipient).unwrap();
-        let value = orchard::value::NoteValue::from_raw(value);
-        let rho = orchard::note::Nullifier::from_bytes(&rho).unwrap();
-        let rseed = orchard::note::RandomSeed::from_bytes(rseed, &rho).unwrap();
-        Note(orchard::note::Note::from_parts(
-            recipient, value, rho, rseed,
-        ))
-    }
-
-    #[staticmethod]
-    fn from_obj(py: Python, obj: PyObject) -> PyResult<Self> {
-        Ok(Note::from_parts(
-            obj.getattr(py, "recipient")?.extract(py)?,
-            obj.getattr(py, "value")?.extract(py)?,
-            obj.getattr(py, "rho")?.extract(py)?,
-            obj.getattr(py, "rseed")?.extract(py)?,
-        ))
-    }
+    orchard::note::Note::from_parts(recipient, value, rho, rseed)
 }
 
 #[pyclass]
 #[derive(Clone, Debug)]
-struct Witness {
-    merkle_path: Option<(u32, [[u8; 32]; 32])>,
-    input_note: orchard::note::Note,
-    output_note: orchard::note::Note,
-    fvk: FullViewingKey,
-    alpha: pasta_curves::Fq,
-    rcv: [u8; 32],
-    #[pyo3(get)]
-    input_index: PyObject,
-}
-
-impl Witness {
-    fn nf_old(&self) -> Nullifier {
-        self.input_note.nullifier(&self.fvk)
-    }
-
-    fn rk(&self) -> VerificationKey<SpendAuth> {
-        let ak: SpendValidatingKey = self.fvk.clone().into();
-        ak.randomize(&self.alpha)
-    }
-    fn cmx(&self) -> ExtractedNoteCommitment {
-        self.output_note.commitment().into()
-    }
-
-    fn cv_net(&self) -> ValueCommitment {
-        let v_net = self.input_note.value() - self.output_note.value();
-        let rcv = ValueCommitTrapdoor::from_bytes(self.rcv).unwrap();
-        ValueCommitment::derive(v_net, rcv)
-    }
-}
+struct OrchardInput(inner::OrchardInput);
 
 #[pymethods]
-impl Witness {
-    #[staticmethod]
-    fn from_msg(py: Python, obj: PyObject) -> PyResult<Self> {
-        let input_note = obj.getattr(py, "input_note")?;
-        let input_note = Note::from_obj(py, input_note)?.0;
-        let output_note = obj.getattr(py, "output_note")?;
-        let output_note = Note::from_obj(py, output_note)?.0;
-        let fvk: [u8; 96] = obj.getattr(py, "fvk")?.extract(py)?;
-        let fvk = orchard::keys::FullViewingKey::from_bytes(&fvk).unwrap();
-        let alpha: [u8; 32] = obj.getattr(py, "alpha")?.extract(py)?;
-        let alpha = pasta_curves::Fq::from_repr(alpha).unwrap();
-        let rcv: [u8; 32] = obj.getattr(py, "rcv")?.extract(py)?;
-        let input_index = obj.getattr(py, "input_index")?;
-        let merkle_path = if input_index.is_none(py) {
-            let mut rng = thread_rng();
-            Some((
-                rng.next_u32(),
-                [(); 32].map(|_| pasta_curves::Fp::random(&mut rng).to_repr()),
-            ))
-        } else {
-            None
-        };
-        Ok(Witness {
-            merkle_path,
-            input_note,
-            output_note,
-            fvk,
-            alpha,
-            rcv,
-            input_index,
-        })
-        //let rcv = orchard::value::ValueCommitTrapdoor::from_bytes(rcv.clone()).unwrap();
-    }
-    fn set_merkle_path(&mut self, merkle_path: (u32, [[u8; 32]; 32])) {
-        self.merkle_path = Some(merkle_path);
+impl OrchardInput {
+    #[new]
+    fn new(py: Python, msg: PyObject, path: (u32, [[u8; 32]; 32])) -> PyResult<Self> {
+        Ok(OrchardInput(inner::OrchardInput {
+            note: note_from_parts(
+                msg.getattr(py, "recipient")?.extract(py)?,
+                msg.getattr(py, "value")?.extract(py)?,
+                msg.getattr(py, "rho")?.extract(py)?,
+                msg.getattr(py, "rseed")?.extract(py)?,
+            ),
+            merkle_path: parse_path(path),
+        }))
     }
 }
 
@@ -143,6 +93,26 @@ fn parse_path(path: (u32, [[u8; 32]; 32])) -> orchard::tree::MerklePath {
 }
 
 #[pyclass]
+#[derive(Debug, Clone)]
+struct OrchardOutput(inner::OrchardOutput);
+
+#[pymethods]
+impl OrchardOutput {
+    #[new]
+    fn new(py: Python, msg: PyObject) -> PyResult<Self> {
+        let recipient: Option<String> = msg.getattr(py, "address")?.extract(py)?;
+        Ok(OrchardOutput(inner::OrchardOutput {
+            recipient: match recipient {
+                Some(r) => trezor_orchard::Recipient::External(r),
+                None => trezor_orchard::Recipient::Change,
+            },
+            amount: msg.getattr(py, "amount")?.extract(py)?,
+            memo: msg.getattr(py, "memo")?.extract(py)?,
+        }))
+    }
+}
+
+#[pyclass]
 struct ProvingKey(orchard::circuit::ProvingKey);
 
 #[pymethods]
@@ -154,11 +124,34 @@ impl ProvingKey {
 }
 
 #[pyclass]
-#[derive(Clone, Debug)]
-struct Prover {
-    anchor: Anchor,
-    enable_spends: bool,
-    enable_outputs: bool,
+#[derive(Debug, Clone)]
+struct TrezorBuilder(Option<inner::TrezorBuilder>);
+
+#[pymethods]
+impl TrezorBuilder {
+    #[new]
+    fn new(
+        inputs: Vec<OrchardInput>,
+        outputs: Vec<OrchardOutput>,
+        anchor: [u8; 32],
+        fvk: [u8; 96],
+        shielding_seed: [u8; 32],
+    ) -> Self {
+        TrezorBuilder(Some(inner::TrezorBuilder {
+            inputs: inputs.into_iter().map(|x| Some(x.0)).collect(),
+            outputs: outputs.into_iter().map(|x| Some(x.0)).collect(),
+            anchor: Anchor::from_bytes(anchor).unwrap(),
+            fvk: FullViewingKey::from_bytes(&fvk).expect("invalid fvk"),
+            shielding_seed,
+        }))
+    }
+
+    fn build(&mut self) -> PyResult<Bundle> {
+        assert!(self.0.is_some());
+        let builder = std::mem::take(&mut self.0).unwrap();
+        let bundle = builder.build().expect("building failed");
+        Ok(Bundle(Authorization::UnprovenAndUnauthorized(Some(bundle))))
+    }
 }
 
 fn print_hex(data: &[u8]) {
@@ -166,116 +159,6 @@ fn print_hex(data: &[u8]) {
         print!("{:x}", byte);
     }
     println!("");
-}
-
-#[pymethods]
-impl Prover {
-    #[new]
-    fn new(anchor: [u8; 32], enable_spends: bool, enable_outputs: bool) -> Self {
-        let anchor = Option::from(Anchor::from_bytes(anchor)).expect("invalid anchor");
-        Prover {
-            anchor,
-            enable_spends,
-            enable_outputs,
-        }
-    }
-
-    fn proof(&self, witnesses: Vec<Witness>, pk: &ProvingKey) -> PyResult<Vec<u8>> {
-        for w in witnesses.iter() {
-            if w.input_note.value().inner() > 0 {
-                // Consistency check: all anchors must be equal.
-                let cm = w.input_note.commitment();
-                let path_root: Anchor = <Option<_>>::from(
-                    parse_path(
-                        w.merkle_path
-                            .ok_or(ProvingError::new_err("Missing merkle path"))?,
-                    )
-                    .root(cm.into()),
-                )
-                .ok_or(ProvingError::new_err("Derived from bottom."))?;
-
-                if path_root != self.anchor {
-                    return Err(ProvingError::new_err("All anchors must be equal."));
-                }
-            }
-
-            // Check if note is internal or external.
-            let _scope = w
-                .fvk
-                .clone()
-                .scope_for_address(&w.input_note.recipient())
-                .ok_or(ProvingError::new_err(
-                    "FullViewingKey does not correspond to the given note",
-                ))?;
-        }
-        let instances: Vec<Instance> = witnesses
-            .iter()
-            .map(|w| {
-                Instance::from_parts(
-                    self.anchor,
-                    w.cv_net(),
-                    w.nf_old(),
-                    w.rk(),
-                    w.cmx(),
-                    self.enable_spends,
-                    self.enable_outputs,
-                )
-            })
-            .collect();
-        for w in witnesses.iter() {
-            println!("cv: {:x?}", w.cv_net().to_bytes());
-            println!("nf: {:x?}", &w.nf_old().to_bytes());
-            println!("rk: {:x?}", <[u8; 32]>::from(w.rk()));
-            println!("cmx: {:x?}", &w.cmx().to_bytes());
-        }
-        println!("{:?}", instances);
-
-        let value_balance = witnesses
-            .iter()
-            .fold(Some(ValueSum::zero()), |acc, w| {
-                acc? + (w.input_note.value() - w.output_note.value())
-            })
-            .unwrap();
-
-        // Compute the transaction binding signing key.
-        let rcvs = witnesses
-            .iter()
-            .map(|w| ValueCommitTrapdoor::from_bytes(w.rcv.clone()).unwrap())
-            .collect::<Vec<ValueCommitTrapdoor>>();
-
-        let bsk = rcvs.iter().sum::<ValueCommitTrapdoor>().into_bsk();
-
-        // Verify that bsk and bvk are consistent.
-        let bvk = (witnesses
-            .iter()
-            .map(|w| w.cv_net())
-            .sum::<ValueCommitment>()
-            - ValueCommitment::derive(
-                value_balance,
-                ValueCommitTrapdoor::from_bytes([0u8; 32]).unwrap(),
-            ))
-        .into_bvk();
-        assert_eq!(VerificationKey::from(&bsk), bvk);
-
-        let circuits = witnesses
-            .into_iter()
-            .map(|w| {
-                let rcv = orchard::value::ValueCommitTrapdoor::from_bytes(w.rcv.clone()).unwrap();
-                Circuit::from_action_context(
-                    parse_path(w.merkle_path.expect("Missing merkle path")),
-                    w.input_note,
-                    w.output_note,
-                    w.fvk,
-                    w.alpha,
-                    rcv,
-                )
-            })
-            .collect::<Option<Vec<Circuit>>>()
-            .unwrap();
-        let proof =
-            Proof::create(&pk.0, &circuits, &instances, thread_rng()).expect("proving failed");
-        Ok(proof.as_ref().into())
-    }
 }
 
 #[pyfunction]
@@ -290,15 +173,222 @@ fn verify_bundle(bundle: Vec<u8>) -> PyResult<()> {
 }
 
 /*
-let value_balance: i64 = witnesses
-    .iter()
-    .fold(Some(ValueSum::default()), |acc, w| {
-        acc? + (w.input_note.value() - w.output_note.value())
-    })
-    .unwrap()
-    .try_into()
-    .unwrap();
-let value_balance: Amount = value_balance.try_into().unwrap();
+ROAD MAP:
+build            :: Builder                                           -> Bundle<InProgress<Unproven, Unauthorized>, V>
+create_proof     :: Bundle<InProgress<Unproven, S>, V>                -> Bundle<InProgress<Proof, S>, V>
+prepare          :: Bundle<InProgress<P, Unauthorized>, V>            -> Bundle<InProgress<P, PartiallyAuthorized>, V>
+sign             :: Bundle<InProgress<P, PartiallyAuthorized>, V>     -> Bundle<InProgress<P, PartiallyAuthorized>, V>
+finalize         :: Bundle<InProgress<Proof, PartiallyAuthorized>, V> -> Bundle<Authorized, V>
+apply_signatures :: Bundle<InProgress<Proof, Unauthorized>, V> -> Bundle<Authorized, V>
+decrypt_outputs_with_keys:: &Bundle<Authorized, V> -> &[Ivks] -> Vec<(usize, IncomingViewingKey, Note, Address, [u8; 512])
 */
-//let bsk = witnesses.iter().map(|w| &w.rcv).sum();
-//let bsk = redpallas::SigningKey::<Binding>::try_from(bsk).unwrap();
+
+fn step_create_proof<S: InProgressSignatures>(
+    bundle: &mut Option<orchard::Bundle<InProgress<Unproven, S>, Amount>>,
+    pk: &ProvingKey,
+    rng: &mut impl RngCore,
+) -> Option<orchard::Bundle<InProgress<Proof, S>, Amount>> {
+    Some(
+        std::mem::take(bundle)
+            .unwrap()
+            .create_proof(&pk.0, rng)
+            .expect("proving failed"),
+    )
+}
+
+fn step_prepare<P: fmt::Debug, R: RngCore + CryptoRng>(
+    bundle: &mut Option<orchard::Bundle<InProgress<P, Unauthorized>, Amount>>,
+    rng: &mut R,
+    sighash: [u8; 32],
+) -> Option<orchard::Bundle<InProgress<P, PartiallyAuthorized>, Amount>> {
+    Some(std::mem::take(bundle).unwrap().prepare(rng, sighash))
+}
+
+fn step_append_signatures<P: fmt::Debug>(
+    bundle: &mut Option<orchard::Bundle<InProgress<P, PartiallyAuthorized>, Amount>>,
+    signatures: Vec<[u8; 64]>,
+) -> Option<orchard::Bundle<InProgress<P, PartiallyAuthorized>, Amount>> {
+    let signatures: Vec<redpallas::Signature<SpendAuth>> = signatures
+        .into_iter()
+        .map(redpallas::Signature::<redpallas::SpendAuth>::from)
+        .collect();
+    Some(
+        std::mem::take(bundle)
+            .unwrap()
+            .append_signatures(&signatures)
+            .expect("cannot append a signature"),
+    )
+}
+
+fn step_finalize(
+    bundle: &mut Option<orchard::Bundle<InProgress<Proof, PartiallyAuthorized>, Amount>>,
+) -> Option<orchard::Bundle<Authorized, Amount>> {
+    Some(
+        std::mem::take(bundle)
+            .unwrap()
+            .finalize()
+            .expect("cannot finalize"),
+    )
+}
+
+/*impl From<orchard::builder::Error> for PyErr {
+    fn from(error: orchard::builder::Error) {
+        orchard::builder::Error::MissingSignatures =>
+        orchard::builder::Error::Proof(_) =>
+        orchard::builder::Error::ValueSum(_) => PyErr::
+    }
+}*/
+
+enum Authorization {
+    UnprovenAndUnauthorized(Option<orchard::Bundle<InProgress<Unproven, Unauthorized>, Amount>>),
+    UnprovenAndPartiallyAuthorized(
+        Option<orchard::Bundle<InProgress<Unproven, PartiallyAuthorized>, Amount>>,
+    ),
+    ProofAndUnauthorized(Option<orchard::Bundle<InProgress<Proof, Unauthorized>, Amount>>),
+    ProofAndPartiallyAuthorized(
+        Option<orchard::Bundle<InProgress<Proof, PartiallyAuthorized>, Amount>>,
+    ),
+    Authorized(Option<orchard::Bundle<orchard::bundle::Authorized, Amount>>),
+}
+
+#[pyclass]
+struct Bundle(Authorization);
+
+// private methods
+impl Bundle {
+    fn is_some(&self) -> bool {
+        match &self.0 {
+            Authorization::UnprovenAndUnauthorized(o) => o.is_some(),
+            Authorization::UnprovenAndPartiallyAuthorized(o) => o.is_some(),
+            Authorization::ProofAndUnauthorized(o) => o.is_some(),
+            Authorization::ProofAndPartiallyAuthorized(o) => o.is_some(),
+            Authorization::Authorized(o) => o.is_some(),
+        }
+    }
+}
+
+#[pymethods]
+impl Bundle {
+    /// The state of the `Bundle`.
+    fn state(&self) -> &str {
+        if !self.is_some() {
+            "Broken"
+        } else {
+            match &self.0 {
+                Authorization::UnprovenAndUnauthorized(_) => "Unproven & Unauthorized",
+                Authorization::UnprovenAndPartiallyAuthorized(_) => {
+                    "Unproven & PartiallyAuthorized"
+                }
+                Authorization::ProofAndUnauthorized(_) => "Proven & Unauthorized",
+                Authorization::ProofAndPartiallyAuthorized(_) => "Proven & PartiallyAuthorized",
+                Authorization::Authorized(_) => "Authorized",
+            }
+        }
+    }
+
+    fn create_proof(&mut self, pk: &ProvingKey) -> PyResult<()> {
+        let mut rng = thread_rng();
+        assert!(self.is_some());
+        self.0 = match &mut self.0 {
+            Authorization::UnprovenAndUnauthorized(b) => {
+                Authorization::ProofAndUnauthorized(step_create_proof(b, pk, &mut rng))
+            }
+            Authorization::UnprovenAndPartiallyAuthorized(b) => {
+                Authorization::ProofAndPartiallyAuthorized(step_create_proof(b, pk, &mut rng))
+            }
+            _ => panic!("cannot create a proof at this state"),
+        };
+        Ok(())
+    }
+
+    fn prepare(&mut self, sighash: [u8; 32]) -> PyResult<()> {
+        let mut rng = thread_rng();
+        assert!(self.is_some());
+        self.0 = match &mut self.0 {
+            Authorization::UnprovenAndUnauthorized(b) => {
+                Authorization::UnprovenAndPartiallyAuthorized(step_prepare(b, &mut rng, sighash))
+            }
+            Authorization::ProofAndUnauthorized(b) => {
+                Authorization::ProofAndPartiallyAuthorized(step_prepare(b, &mut rng, sighash))
+            }
+            _ => panic!("cannot prepare at this state"),
+        };
+        Ok(())
+    }
+
+    fn append_signatures(&mut self, signatures: Vec<[u8; 64]>) -> PyResult<()> {
+        assert!(self.is_some());
+        self.0 = match &mut self.0 {
+            Authorization::UnprovenAndPartiallyAuthorized(b) => {
+                Authorization::UnprovenAndPartiallyAuthorized(step_append_signatures(b, signatures))
+            }
+            Authorization::ProofAndPartiallyAuthorized(b) => {
+                Authorization::ProofAndPartiallyAuthorized(step_append_signatures(b, signatures))
+            }
+            _ => panic!("cannot append a signature at this state"),
+        };
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> PyResult<()> {
+        assert!(self.is_some());
+        self.0 = match &mut self.0 {
+            Authorization::ProofAndPartiallyAuthorized(b) => {
+                Authorization::Authorized(step_finalize(b))
+            }
+            _ => panic!("cannot finalize at this state"),
+        };
+        Ok(())
+    }
+
+    fn serialized<'a>(&self, py: Python<'a>) -> PyResult<&'a PyBytes> {
+        let mut serialized = Vec::<u8>::new();
+        match &self.0 {
+            Authorization::Authorized(b) => {
+                write_v5_bundle(b.as_ref(), &mut serialized).expect("cannot serialize")
+            }
+            _ => panic!("cannot serialize at this state"),
+        };
+        Ok(PyBytes::new(py, &serialized))
+    }
+
+    fn decrypt_outputs_with_fvk<'a>(
+        &self,
+        py: Python<'a>,
+        fvk: [u8; 96],
+    ) -> PyResult<Vec<(&'a PyDict, &'a PyBytes)>> {
+        let fvk = FullViewingKey::from_bytes(&fvk).expect("invalid fvk");
+        let keys = [fvk.to_ivk(Scope::External), fvk.to_ivk(Scope::Internal)];
+        let res = match &self.0 {
+            Authorization::Authorized(Some(b)) => b.decrypt_outputs_with_keys(&keys),
+            _ => panic!("cannot decrypt at this state"),
+        };
+        res.iter()
+            .map(|(_, _, note, _, _)| {
+                (
+                    note_to_dict(&note, py),
+                    PyBytes::new(
+                        py,
+                        &ExtractedNoteCommitment::from(note.commitment()).to_bytes(),
+                    ),
+                )
+            })
+            .map(|(x, y)| match x {
+                Ok(z) => Ok((z, y)),
+                Err(z) => Err(z),
+            })
+            .collect()
+    }
+}
+
+fn note_to_dict<'a>(note: &orchard::note::Note, py: Python<'a>) -> PyResult<&'a PyDict> {
+    let dict = PyDict::new(py).to_owned();
+    dict.set_item(
+        "recipient",
+        PyBytes::new(py, &note.recipient().to_raw_address_bytes()),
+    )?;
+    dict.set_item("value", note.value().inner())?;
+    dict.set_item("rho", PyBytes::new(py, &note.rho().to_bytes()))?;
+    dict.set_item("rseed", PyBytes::new(py, note.rseed().as_bytes()))?;
+    Ok(dict)
+}

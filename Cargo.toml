@@ -1,5 +1,5 @@
 [package]
-name = "trezor_orchard"
+name = "py_trezor_orchard"
 version = "0.1.0"
 edition = "2021"
 
@@ -30,6 +30,8 @@ zcash_primitives = "0.7.0"
 #zcash_primitives = { path = "/home/agi/code/librustzcash/zcash_primitives"}
 subtle = "2.3"
 incrementalmerkletree = "0.3"
+trezor_orchard = { path = "/home/agi/code/trezor_orchard"}
+
 
 [patch.crates-io.orchard]
 path = "/home/agi/code/orchard"
