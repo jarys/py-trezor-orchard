@@ -6,25 +6,20 @@ use pyo3::{
     wrap_pyfunction,
 };
 
-use ff::{Field, PrimeField};
 use rand::thread_rng;
 use rand_core::{CryptoRng, RngCore};
 use trezor_orchard as inner;
 
 use orchard::{
     self,
-    builder::{
-        InProgress, InProgressSignatures, PartiallyAuthorized, SigningMetadata, SigningParts,
-        SpendInfo, Unauthorized, Unproven,
-    },
-    bundle::{Authorized, Flags},
-    circuit::{Circuit, Instance, Proof},
-    keys::{FullViewingKey, Scope, SpendValidatingKey},
-    note::{ExtractedNoteCommitment, Nullifier},
+    builder::{InProgress, InProgressSignatures, PartiallyAuthorized, Unauthorized, Unproven},
+    bundle::Authorized,
+    circuit::Proof,
+    keys::{FullViewingKey, Scope},
+    note::ExtractedNoteCommitment,
     primitives::redpallas,
-    primitives::redpallas::{SpendAuth, VerificationKey},
+    primitives::redpallas::SpendAuth,
     tree::Anchor,
-    value::{ValueCommitTrapdoor, ValueCommitment, ValueSum},
     Address,
 };
 
@@ -58,7 +53,7 @@ fn note_from_parts(
     let rho = orchard::note::Nullifier::from_bytes(&rho).unwrap();
     let rseed = orchard::note::RandomSeed::from_bytes(rseed, &rho).unwrap();
 
-    orchard::note::Note::from_parts(recipient, value, rho, rseed)
+    orchard::note::Note::from_parts(recipient, value, rho, rseed).unwrap()
 }
 
 #[pyclass]
@@ -154,6 +149,7 @@ impl TrezorBuilder {
     }
 }
 
+#[allow(dead_code)]
 fn print_hex(data: &[u8]) {
     for byte in data {
         print!("{:x}", byte);
