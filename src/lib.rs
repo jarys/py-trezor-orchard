@@ -227,14 +227,6 @@ fn step_finalize(
     )
 }
 
-/*impl From<orchard::builder::Error> for PyErr {
-    fn from(error: orchard::builder::Error) {
-        orchard::builder::Error::MissingSignatures =>
-        orchard::builder::Error::Proof(_) =>
-        orchard::builder::Error::ValueSum(_) => PyErr::
-    }
-}*/
-
 enum Authorization {
     UnprovenAndUnauthorized(Option<orchard::Bundle<InProgress<Unproven, Unauthorized>, Amount>>),
     UnprovenAndPartiallyAuthorized(
@@ -292,7 +284,7 @@ impl Bundle {
             Authorization::UnprovenAndPartiallyAuthorized(b) => {
                 Authorization::ProofAndPartiallyAuthorized(step_create_proof(b, pk, &mut rng))
             }
-            _ => panic!("cannot create a proof at this state"),
+            _ => return Err(ProvingError::new_err("cannot create a proof at this state")),
         };
         Ok(())
     }
@@ -307,7 +299,7 @@ impl Bundle {
             Authorization::ProofAndUnauthorized(b) => {
                 Authorization::ProofAndPartiallyAuthorized(step_prepare(b, &mut rng, sighash))
             }
-            _ => panic!("cannot prepare at this state"),
+            _ => return Err(ProvingError::new_err("cannot prepaire at this state")),
         };
         Ok(())
     }
@@ -321,7 +313,11 @@ impl Bundle {
             Authorization::ProofAndPartiallyAuthorized(b) => {
                 Authorization::ProofAndPartiallyAuthorized(step_append_signatures(b, signatures))
             }
-            _ => panic!("cannot append a signature at this state"),
+            _ => {
+                return Err(ProvingError::new_err(
+                    "cannot append signatures at this state",
+                ))
+            }
         };
         Ok(())
     }
@@ -332,7 +328,7 @@ impl Bundle {
             Authorization::ProofAndPartiallyAuthorized(b) => {
                 Authorization::Authorized(step_finalize(b))
             }
-            _ => panic!("cannot finalize at this state"),
+            _ => return Err(ProvingError::new_err("cannot finalize at this state")),
         };
         Ok(())
     }
@@ -343,7 +339,7 @@ impl Bundle {
             Authorization::Authorized(b) => {
                 write_v5_bundle(b.as_ref(), &mut serialized).expect("cannot serialize")
             }
-            _ => panic!("cannot serialize at this state"),
+            _ => return Err(ProvingError::new_err("cannot serialize at this state")),
         };
         Ok(PyBytes::new(py, &serialized))
     }
@@ -357,7 +353,7 @@ impl Bundle {
         let keys = [fvk.to_ivk(Scope::External), fvk.to_ivk(Scope::Internal)];
         let res = match &self.0 {
             Authorization::Authorized(Some(b)) => b.decrypt_outputs_with_keys(&keys),
-            _ => panic!("cannot decrypt at this state"),
+            _ => return Err(ProvingError::new_err("cannot decrypt at this state")),
         };
         res.iter()
             .map(|(_, _, note, _, _)| {
